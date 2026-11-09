@@ -1,14 +1,29 @@
 name = "ParameterStudies"
 uuid = "eba922c0-cbcd-4b62-aea5-576ce392330a"
-authors = ["Kyle Beggs (beggskw@gmail.com) and contributors"]
 version = "0.1.0"
+authors = ["Kyle Beggs (beggskw@gmail.com) and contributors"]
+
+[deps]
+Adapt = "79e6a3ab-5dfb-504d-930d-738a2a938a0e"
+CommonSolve = "38540f10-b2f7-11e9-35d8-d573e4eb0ff2"
+Distributed = "8ba89e20-285c-5b6f-9357-94700520ee1b"
+KernelInterface = "4ee993da-d684-4d17-a7dd-4e58e78d92bf"
+OhMyThreads = "67456a42-1dca-4109-a031-0a68de7e3ad5"
 
 [compat]
+Adapt = "4"
+CommonSolve = "0.2"
+Distributed = "1"
+KernelInterface = "0.4"
+OhMyThreads = "0.8"
 julia = "1.10"
 
 [extras]
+Adapt = "79e6a3ab-5dfb-504d-930d-738a2a938a0e"
+CommonSolve = "38540f10-b2f7-11e9-35d8-d573e4eb0ff2"
 JET = "c3a54625-cd67-489e-a8e7-0a5a0ff4e31b"
+KernelInterface = "4ee993da-d684-4d17-a7dd-4e58e78d92bf"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-test = ["JET", "Test"]
+test = ["Adapt", "CommonSolve", "JET", "KernelInterface", "Test"]
