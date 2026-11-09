@@ -2,108 +2,101 @@
 
 **Status:** draft for review · **Date:** 2026-11-09
 
-This document specifies how ParameterStudies takes on ArmyHeart's 1D cable batching, at the level of abstractions and type hierarchy. It stops above implementation detail: keyword surfaces, compat bounds, and step-by-step porting order are settled after this shape is. It deliberately does not redesign the study lifecycle the README describes (study designs, canonical identities, resumable storage, provenance), which remains future work and interacts with this design only through open question 2. The source being ported is ArmyHeart at `c45ffdd` with the diffusion fix from `39726ee`. This design reverses the ParameterStudies rows of ArmyHeart's `SPINOUT_PLAN.md` (domain-neutral, no CUDA, RallypointOne): the package moved to DerangedIons and is now cardiac-aware by decision. The style draws on three studied inspirations: **LockstepODE.jl** (N systems sharing a timestep, backend-generic through KernelAbstractions), **FlashBang.jl** (a monodomain model as an inert declaration, kept separate from its discretization), and **DiffEqGPU.jl** (the ensemble algorithm as a typed object holding the backend).
+This document specifies how ParameterStudies executes a batch of simulations, at the level of abstractions and type hierarchy. It stops above implementation detail: keyword surfaces, compat bounds, and porting order are settled after this shape is. It deliberately does not redesign the study lifecycle the README describes (study designs, canonical identities, resumable storage, provenance), which remains future work; the two meet at one point, which is that a study design will produce the cases this document's `batch` consumes. The style draws on three studied inspirations: **SciML's ensemble interface** (one prototype problem, a per-trajectory modification, and the ensemble algorithm as a typed object), **CardiacAbstractions.jl** (a light base package owns the verbs and the heavy packages add methods), and **LockstepODE.jl** (N systems sharing a timestep as one array, which is the execution shape this package must be able to request without implementing).
+
+**Revision 2026-11-09: the cable solver is not ported here.** The first draft of this document moved ArmyHeart's batched 1D cable solver into this package, with its own `CableGrid`, `CableModel`, Rush-Larsen integrator, and diffusion kernel, and declared the package cardiac-aware. That is reversed. A cable is a monodomain simulation, and monodomain simulations on structured grids are FlashBang.jl's job; a second implementation here would be a second set of numerics to validate and keep in agreement. The caller now builds **one runnable simulation** with the package that owns the physics, and this package executes a batch of it. ParameterStudies is domain-neutral again, as its README and ArmyHeart's `SPINOUT_PLAN.md` always said. The consequence that matters is stated in §6: the single-kernel-launch GPU sweep now depends on FlashBang growing a batched form, where the first draft would have had it on day one.
 
 ## 1. What this adds
 
-A cardiac parameter sweep asks the same question thousands of times with different ion-channel scalings: run a cable, classify what it did. Run independently, every cable pays for its own kernel launches and its own array traffic. But every cable has the same grid, timestep, and cell model code, and differs only by a few numbers. That makes the sweep a single 3D array, `[N_cell, N_spatial, N_cables]`, advanced by one kernel launch, which is where a GPU earns its speedup.
+A parameter sweep asks the same question thousands of times with a few numbers changed: run a simulation, record what it did. The caller already knows how to run it once. What they lack is a way to say "now run it for all of these" without rewriting the simulation as a batch.
 
-The central claim of this document is that **there are two distinct execution shapes, and the type system should say so**. *Mapping* runs an arbitrary function over independent cases: it isolates failures and imposes no structure on the cases. *Lockstep* advances many cases as one array: it is fast because the cases are forced to share everything except their declared parameters, and for the same reason they also share fate. ArmyHeart merges these under one `batch` name with a `backend` keyword that means a `Symbol` in one method and a device in the other. Here they are separate types with separate contracts.
+The central claim of this document is that **there are two distinct execution shapes, and this package owns the choice between them but the physics of neither**. *Mapping* runs independent cases one at a time: it isolates failures and asks nothing of the simulation beyond being runnable. *Lockstep* advances many cases as one set of shared arrays with one kernel launch per step, which is where a GPU earns its speedup: run independently, every case pays for its own launches and its own array traffic, though the cases differ only by a few numbers. Lockstep is fast because the cases are forced to share everything except their parameters, and for the same reason they share fate.
+
+Building the shared arrays requires knowing the simulation's state layout, and the layout belongs to the simulation package. So lockstep is split along that line: this package decides *which* cases run together and *where*, and asks the simulation package to produce the stacked simulation. The heat-transfer analogy is a batch furnace: the scheduler decides which parts go in which load, but only the part's designer knows how it can be racked.
 
 ## 2. Design principles
 
-1. **Lockstep is the unit of GPU execution.** The kernel launch covers all cables at once; anything that would break that shared launch is a non-goal, not a feature request.
-2. **What varies is declared; everything else is shared.** Per-cable parameters and initial states are the only degrees of freedom, so the batch's structure is visible in its configuration.
-3. **Execution strategy is a typed value.** Serial, threaded, worker-pool, and lockstep execution are objects passed positionally, replacing a keyword whose meaning changed by method.
-4. **KernelAbstractions is the only device layer.** Every CUDA call in the source maps to a backend-generic call, so the package loads and runs with no GPU stack and a user selects a device by passing `CUDABackend()`.
-5. **The cell model is a duck-typed contract.** This package depends on no cell-model package and none depends on it, which is what lets ArmyHeart's existing models run without changes.
-6. **No state is captured across a buffer swap.** Anything derived from the integrator's state is recomputed after the swap; §6 explains the bug this rule exists to prevent.
-7. **The numbers are the contract.** A cable run must match ArmyHeart at `39726ee` under declared tolerances, and any divergence is named and justified.
+1. **This package runs simulations; it never contains one.** No grids, models, integrators, or kernels live here, so there is exactly one implementation of each physics to validate.
+2. **One runnable simulation is the unit of input.** The caller supplies a simulation that already works alone, which means a batch can always be debugged by running one of its cases by hand.
+3. **A case is opaque.** This package carries cases to the caller's function or to the simulation package and never interprets a parameter name, which is what keeps it domain-neutral.
+4. **Sweeping asks nothing of the simulation package.** Only lockstep requires methods, so a package pays for the interface only when it has a batched form to offer.
+5. **The simulation package owns its layout.** Stacking N cases into shared arrays is layout code, so it is a method the simulation package provides, never something this package derives.
+6. **Execution strategy is a typed value.** Serial, threaded, worker-pool, and lockstep execution are objects passed positionally, replacing a keyword whose meaning changed by method.
+7. **A batch changes throughput and nothing else.** Any executor must return, for each case, what running that case alone returns, within a tolerance the simulation package declares.
 
 ## 3. The grammar
 
 ```
-CableGrid + CableModel  →  CableBatchConfig  →  batch(config, params, Lockstep(backend))  →  (times, voltages)
-(shared geometry, law)     (shared vs varying)       (one array per device)                  (host matrices)
+one runnable sim  +  cases  →  batch(apply, sim, cases, executor)  →  one result per case, in case order
+(built by the physics       (apply: how one case changes the sim;
+ package, as if run alone)   executor: which cases run together, and where)
 ```
 
 The three canonical programs, which become the docs quickstarts and acceptance examples:
 
 ```julia
-# (a) GPU sweep: every combination of two channel scalings, spread across all GPUs
-config = CableBatchConfig(;
-    create_model = () -> CableModel(; κ = κ_calibrated, ion = make_cell(CuVector{T}(constants))),
-    grid = CableGrid(N_nodes, L),
-    u0 = prepaced_state,
-    parameter_index = ToRORdTrauma.parameter_index,
-    varying = ["ICaL_Multiplier", "IKr_Multiplier"],
-    tspan = (t_start, t_end),
-    dt,
-    coordinates = Vec.(cable_coordinates(grid)),
-)
-params = [Dict("ICaL_Multiplier" => a, "IKr_Multiplier" => b) for a in As for b in Bs]
-times, voltages = batch(config, params, Lockstep(CUDABackend(); batch_size); saveat)
+# The single runnable sim: a FlashBang cable, built exactly as if it were going to run alone.
+model = MonodomainModel(; κ, ion = cell, stim)
+f     = semidiscretize(ReactionDiffusionSplit(model), FiniteDifferenceDiscretization(), grid)
+sim   = Simulation(OperatorSplittingProblem(f, u0, tspan), alg; dt, saveat)
+simulate(sim)                                        # works alone; nothing below changes it
 
-# (b) the same study on a workstation: only the executor changes
-times, voltages = batch(config, params, Lockstep(CPU()); saveat)
+# (a) a sweep on a workstation: every combination of two channel scalings, one case per task
+cases   = [(ICaL_Multiplier = a, IKr_Multiplier = b) for a in As for b in Bs]
+results = batch(sim, cases, Threaded()) do sim, case
+    with_channel_scalings(sim, case)                 # the caller's own function: one case in, one sim out
+end
 
-# (c) independent cases that cannot share an array, such as cables with different grids
-batch(run_and_save_case, cases, Threaded())
+# (b) the same sweep as shared arrays on every GPU: FlashBang reads the cases itself
+results = batch(sim, cases, Lockstep(CUDABackend(); batch_size))
+
+# (c) work that is not a simulation at all, such as post-processing saved cases
+batch(classify_and_save, paths, Workers())
 ```
 
 ## 4. The type system
 
 ```
-CableGrid{T}                       # one uniform 1D geometry, shared by every cable in a batch
-CableModel{T, I}                   # the tissue law: κ and the cell model (the ion slot)
-CableBatchConfig{T, …}             # everything the batch shares, and the names of what varies
+Simulation{P, A, O}                # one runnable sim: a problem, its algorithm, its solve options
 
-AbstractMapExecutor                # runs any f over independent cases
+simulate(sim)                      # run one sim; defaults to solve, so nobody implements it
+
+# the lockstep interface: the only methods a simulation package ever writes, and only to opt in
+stacked(problem, cases)            #   one problem advancing all cases as shared arrays
+unstacked(result)                  #   split a stacked result into one result per case
+
+AbstractMapExecutor                # runs cases independently; needs no methods from anyone
 ├── Serial                         #   in order, on the calling task
 ├── Threaded                       #   OhMyThreads tasks
-└── Workers                        #   Distributed.pmap on an existing pool; isolates per-item failures
+└── Workers                        #   Distributed.pmap on an existing pool; isolates per-case failures
 
-Lockstep{B, E}                     # runs a CableBatchConfig as shared arrays on backend B
-
-# internal machinery, public for those who write their own solve loop
-BatchedRushLarsenIntegrator{…}     # reaction: owns state, swaps u and u_new each step
-BatchedDiffusionOperator{…}        # diffusion: second-order, no-flux Laplacian
-BatchedMonodomainSetup{…}          # Lie splitting of the two; the object step_batched! advances
+Lockstep{B}                        # runs cases as stacked sub-batches on backend B; needs the lockstep interface
 ```
 
-The mockups below are indicative, not final: they show what each type owns and how it is parameterized. Field names may move in the implementation pass, constructors and validation are omitted, and `…` marks deferred detail.
+The mockups below are indicative, not final: they show what each type owns and how it is parameterized. Names may move in the implementation pass, constructors and validation are omitted, and `…` marks deferred detail.
 
-**`CableGrid` and `CableModel`** replace `StructuredGrid` + `FiniteDifferenceDiscretization` and Thunderbolt's `MonodomainModel`. Thunderbolt is unregistered and cannot be a dependency, and the batched path used little of it anyway: `.stim`, `χ`, and `Cₘ` were never read, and `disc` was accepted and silently ignored, so a caller who passed fourth order or Dirichlet got second-order no-flux with no warning. Narrowing the types to what the solver actually does turns that silent lie into an impossible input. The trade-off is that these types are deliberately not general; anything beyond a uniform 1D cable belongs in FlashBang.
+**`Simulation`** is what "runnable" means: a problem alone cannot be run, because the algorithm and the timestep are not part of it. Bundling the three makes the unit of input a value that `simulate` can execute with no further arguments, and it gives the lockstep interface one place to reach the problem. It follows CommonSolve's shape, so any `solve`-able problem is a simulation without its package knowing this one exists; a package that does not speak `solve` implements `simulate` on its own type instead. The trade-off is that this type knows nothing: it cannot validate a problem, a case, or an option, and every such error surfaces from the simulation package.
 
 ```julia
-struct CableGrid{T <: Real}
-    N      :: Int       # nodes per cable
-    L      :: T         # cable length
-    origin :: T
-end
-
-struct CableModel{T <: Real, I}
-    κ   :: T            # uniform diffusivity
-    ion :: I            # any object meeting the cell-model contract in §6
+struct Simulation{P, A, O}
+    problem :: P        # opaque here; built and understood by the simulation package
+    alg     :: A
+    options :: O        # dt, saveat, callbacks: whatever the single run would pass
 end
 ```
 
-**`CableBatchConfig`** is the root object of a lockstep study: it separates what the batch shares from what varies. `create_model` is a factory rather than a value because a GPU-resident model has to be built after its device is selected, once per device; passing a ready-made model would pin every device's work to one GPU's memory. `parameter_index` is a plain function so the config works with any module's lookup, where ArmyHeart reached into a `CELLMODULE`. It replaces `GPUBatchConfig`, whose name stopped being accurate once CPU runs became first-class. `coordinates` is overridable because ToRORdTrauma's stimulus falls back to a `stim(x::Vec{1}, t)` method, so the default coordinate type would throw a `MethodError` against that model.
+**Applying a case is the caller's function, not an interface.** Mapping needs two things: a way to turn the prototype into one case, and a way to run it. Running is `simulate`, which defaults to `solve`. Turning the prototype into a case is a plain function `(sim, case) -> sim` passed to `batch`, because the caller built the simulation and already knows how to rebuild it with different numbers. So a simulation package writes nothing to get serial, threaded, and distributed sweeps. The trade-off is that the function is opaque: this package cannot tell what it changed, which is fine for mapping and is exactly why lockstep cannot use it.
+
+**The lockstep interface** is the one place a simulation package must write methods, because it is the one thing nobody outside the package can do. Laying N cases out as shared arrays means knowing the state layout, where parameters live, and how to cut the result apart again. `stacked` receives the raw cases as data, so the package can turn them into a parameter array along a case axis instead of N separate models; for FlashBang the natural reading is that a case's parameters are overrides varying along that axis, the way its existing `overrides` vary along space. Under `Lockstep` the caller's apply function is therefore not used, and the two readings of a case are held together by the batch-equals-solo rule in §6.
 
 ```julia
-Base.@kwdef struct CableBatchConfig{T <: Real, F, P, U, X}
-    create_model    :: F                # () -> CableModel, called once per device after selecting it
-    grid            :: CableGrid{T}
-    u0              :: U                # [N_cell, N_spatial] shared, or [N_cell, N_spatial, N_cables] per cable
-    parameter_index :: P                # name -> index into cell_parameters(ion)
-    varying         :: Vector{String}   # the only parameters allowed to differ between cables
-    tspan           :: Tuple{T, T}
-    dt              :: T
-    coordinates     :: X = cable_coordinates(grid)   # any isbits element the cell model accepts
-end
+function simulate end       # simulate(sim) -> result;   default: solve(sim.problem, sim.alg; sim.options...)
+
+function stacked end        # stacked(problem, cases) -> problem whose state carries a case axis
+function unstacked end      # unstacked(result) -> one result per case, in the order given to stacked
 ```
 
-**`AbstractMapExecutor`** owns "run this function over these cases" and makes no assumption about what the function does. It replaces `backend=:threads` and friends. `Workers` uses the pool the caller already set up: ArmyHeart's in-function `addprocs` created workers with no packages loaded, and `on_error` then reduced every resulting failure to a warning, so a run could complete having done nothing.
+**`AbstractMapExecutor`** owns "run these independently" and makes no assumption about what is being run. `batch(apply, sim, cases, executor)` is sugar over the plain form `batch(f, items, executor)` of program (c), with `f = case -> simulate(apply(sim, case))`. It replaces ArmyHeart's `backend=:threads` and friends. `Workers` uses the pool the caller already set up: ArmyHeart's in-function `addprocs` created workers with no packages loaded, and `on_error` then reduced every resulting failure to a warning, so a run could complete having done nothing.
 
 ```julia
 abstract type AbstractMapExecutor end
@@ -117,102 +110,68 @@ end
 struct Workers <: AbstractMapExecutor end    # caller owns addprocs and @everywhere using
 ```
 
-**`Lockstep`** owns where and how a shared-array solve runs. It is not an `AbstractMapExecutor`, on purpose: a map executor accepts any function, while lockstep accepts only a `CableBatchConfig`, so one hierarchy would make `batch(f, cases, Lockstep(…))` type-check and then fail at runtime. Cables are divided evenly across devices, one pinned thread per device, then into sub-batches of `batch_size` on each device, because a device has finite memory no matter how many cables a sweep needs. `inner` replaces the `internal_threading::Bool` flag and reuses the map vocabulary for CPU loops, so `Lockstep(CPU(); inner = Serial())` reads as what it does. GPU runs ignore it.
+**`Lockstep`** owns the scheduling half of a shared-array run: cases are divided evenly across devices, then into sub-batches of `batch_size` on each device, because a device has finite memory no matter how many cases a sweep needs. Each sub-batch is stacked on the host, moved to its device with `Adapt`, run with the same `simulate` a single case uses, and unstacked. Stacking on the host and adapting afterwards replaces the first draft's `create_model` factory: a host-built simulation is not pinned to any device's memory, so one prototype serves every GPU. `Lockstep` is not an `AbstractMapExecutor`, on purpose: a map executor accepts any function, while lockstep accepts only a simulation whose package implements `stacked`, so one hierarchy would make `batch(f, items, Lockstep(…))` type-check and then fail at runtime.
 
 ```julia
-struct Lockstep{B <: KernelAbstractions.Backend, E <: AbstractMapExecutor}
-    backend     :: B
-    batch_size  :: Int                       # cables per kernel launch, limited by device memory
-    max_devices :: Int                       # defaults from KernelAbstractions.ndevices(backend)
-    inner       :: E                         # CPU loop strategy
-end
-```
-
-**The internal machinery** ports nearly unchanged, with the integrator's abstract-typed fields tightened to concrete parameters. The reaction step and the diffusion step alternate as Lie splitting, and they meet in exactly one place: the voltage slice of the state. `BatchedMonodomainSetup` loses its `V_batched` field, which is the §6 bug. `BatchedDiffusionOperator` loses the `stim`, `t`, and `x_positions` arguments its kernel never read, and on `CPU` it runs a host loop rather than a kernel, because KernelAbstractions 0.10 makes `CPU` an alias of `POCLBackend` and a plain CPU run should not route through an OpenCL compiler.
-
-```julia
-mutable struct BatchedRushLarsenIntegrator{T, CM, B, A3, M, X, E}
-    cellmodel    :: CM
-    u            :: A3     # [N_cell, N_spatial, N_cables]
-    u_new        :: A3     # swapped with u every step, so never hold a view of either
-    x_positions  :: X
-    p_all_cables :: M      # [N_params, N_cables], expanded once on the host from the varying set
-    t            :: T
-    dt           :: T
-    backend      :: B
-    inner        :: E
-    …                      # N_cell, N_spatial, N_cables
-end
-
-struct BatchedDiffusionOperator{T, B, E}
-    N_spatial :: Int
-    N_cables  :: Int
-    dx        :: T
-    κ         :: T
-    backend   :: B
-    inner     :: E
-end
-
-struct BatchedMonodomainSetup{T, CI, DO, DV}
-    cell_integrator :: CI
-    diffusion_op    :: DO
-    dV_batched      :: DV     # [N_spatial, N_cables] diffusion buffer
-    dt              :: T
-    tspan           :: Tuple{T, T}
-    …                         # N_spatial, N_cables
+struct Lockstep{B}
+    backend     :: B        # the device family; a KernelAbstractions backend value
+    batch_size  :: Int      # cases per stacked sub-batch, limited by device memory
+    max_devices :: Int      # defaults from the backend's device count
 end
 ```
 
 ## 5. Alternatives considered
 
-**Split the code: generic executors here, cable solver in FlashBang.** This keeps ParameterStudies domain-neutral, gives the solver the home its physics suggests, and keeps KernelAbstractions and its PoCL dependency out of packages that only want study records. It was offered and declined in favor of one package. In its favor as a decision: FlashBang today lists Rush-Larsen inner solvers as out of scope and has no batching, so landing the solver there means building those first, while the integrator, kernel, and device loop change together and stay simple to develop as a unit. The cost is real and accepted: this package no longer matches its original charter.
+**Port ArmyHeart's cable solver here (the first draft).** It delivers the GPU sweep immediately: ArmyHeart's batched Rush-Larsen integrator, diffusion kernel, and device loop already exist, run ToRORdTrauma today, and are simple to develop as one unit. FlashBang, by contrast, has no batched layout and lists Rush-Larsen as out of scope, so the fast path now waits on work in another package. It loses because the cost compounds: a second monodomain discretization that must be validated against the first, cardiac types in a package chartered as domain-neutral, and a `CableGrid` that every future FlashBang feature (anisotropy, heterogeneity, higher dimensions) would have to be re-declined for. ArmyHeart's history is the warning: its batched path silently dropped half its diffusion increments until `39726ee`, and a separate batched solver is exactly where such a bug can hide, because nothing forces it to agree with the unbatched one.
 
-**Build on LockstepODE's `BatchedFunction`.** LockstepODE already has backend-generic batching with tested zero-allocation evaluation, and `SPINOUT_PLAN.md` assigned it this job. But `BatchedFunction` is a right-hand side, `(du, u, p, t)`, handed to OrdinaryDiffEq, while Rush-Larsen is a step map, `u → u_new`, supplied by the cell model itself. Adapting one to the other means writing a Rush-Larsen algorithm for the SciML interface first. This becomes the better shape if a registered Rush-Larsen algorithm lands; the integrator could then be replaced without touching the config or executor layer.
+**Stack generically inside this package.** DiffEqGPU's `EnsembleGPUArray` shows it is possible to batch a problem without its package's help, by treating the right-hand side as a kernel body over a trajectory axis. This would make lockstep work for any ODE with no contract at all. It loses for the simulations this package exists to serve: a FlashBang problem is operator-split, keeps its parameters in functor fields rather than in `p`, and has a state layout with exactly one owner by its own design rules. Stacking it from outside means reaching into all three.
 
-**DiffEqGPU's `EnsembleGPUKernel`.** Its documented form is an out-of-place ODE on StaticArrays with `prob_func` for per-trajectory variation, which is an elegant fit for small systems. A cable of 65 states over hundreds of nodes is not a static-size value, and the spatial coupling within a cable is the point of the simulation. The typed-ensemble-algorithm idea is what this design keeps.
+**Use `EnsembleProblem` directly and add nothing.** It is the established interface, already has `prob_func` for per-trajectory variation and threaded and distributed algorithms, and SciML users know it. The map path here is deliberately the same shape and may be implemented on top of it. It is not sufficient alone because it has no way to ask a simulation package for a stacked problem, and because the study lifecycle this package is chartered for must also run simulations that are not SciML problems.
 
-**CUDA as a weakdep extension.** This is the conventional shape and makes the GPU boundary explicit in the package's layout. Every CUDA use in the source maps to a KernelAbstractions or Adapt call, including device selection, so an extension would be empty. KernelAbstractions becomes the hard dependency instead.
+**Make case application a method too (`specialize(problem, case)`, the previous revision).** One interface for both shapes is tidy, and it guarantees mapping and lockstep read a case the same way. It loses because it makes every simulation package write and maintain a method before anyone can run a threaded sweep, for something the caller can express in a line. `stacked` already receives the cases as data, so lockstep never needed it.
 
-**Keep ArmyHeart's keyword-driven `batch`.** It is familiar, and porting it verbatim would be less work. It overloads `backend`, leaves `internal_threading` as a boolean, and lets an old GPU script run on CPU without complaint. See open question 1.
+**Drop the prototype entirely and take a factory `case -> sim`.** This is the least possible input. It works for mapping and forecloses lockstep, because given N opaque simulations there is no way to know they share a grid, a timestep, and a model, which is the precondition for one array. Keeping the prototype as a separate argument is what lets program (b) differ from (a) by the executor alone.
+
+**Keep ArmyHeart's keyword-driven `batch`.** It is familiar, and porting it verbatim would be less work. It overloads `backend` to mean a `Symbol` in one method and a device in the other, and lets an old GPU script run on CPU without complaint. See open question 1.
 
 ## 6. Cross-cutting rules
 
-**The cell-model contract.** A cell model is callable as `cell(u, t, dt, p, u_new, x)`, with `t` and `dt` of the state's element type. It must write every entry of `u_new`, since that buffer is reused. `u[1]` is voltage. It must be Adapt-compatible and isbits after adaptation. `cell_parameters(cell)` returns its parameter vector, defaulting to `cell.CONSTANTS` and overridable. `ToRORdTraumaModel` already satisfies this with no new methods.
+**What this asks of FlashBang.** Mapping asks nothing: it works today with any simulation FlashBang can already run. Lockstep needs three things FlashBang does not have today: a batched layout (its own DESIGN.md already names this as a second layout type over the `StateBlockedLayout` seam), `stacked` and `unstacked` methods over it, and, for ArmyHeart's actual sweeps, a Rush-Larsen inner solver and an isbits ToRORd. Until those land, GPU lockstep sweeps of ToRORdTrauma stay in ArmyHeart, and this package ships the map executors and the lockstep interface. That gap is the price of having one solver.
 
-**Never hold a view across the swap.** `step!` swaps `u` and `u_new` every step, but a Julia `SubArray` pins its parent *object*, not the struct field. ArmyHeart stored `V_batched` at construction, so after every odd step that view pointed at the scratch buffer: diffusion was written there, then overwritten wholesale by the next reaction step. Exactly half the diffusion increments vanished and the solver integrated $\kappa/2$; `39726ee` measured the ratio at 0.5. Nothing looked wrong, because a cable at $\kappa/2$ still conducts, only slower. The rule here: `voltage(setup)` recomputes the view, and is called after `step!` and at each save. `legacy_half_diffusion` is not carried over, since a new package has no old results to reproduce; `39726ee` remains available for that.
+**Batch equals solo.** For every case, `batch` under any executor must agree with that case run alone. Under map executors this is identity: the result is `simulate(apply(sim, case))`. Under `Lockstep` the reference is the simulation package's own single run with the case's parameters, and the package declares the tolerance, since a stacked kernel need not be bitwise identical to an unstacked one. A caller whose apply function and the package's `stacked` disagree about what a case means will see it here. This is the package's one golden-master rule, and it is aimed at the class of bug ArmyHeart's half-diffusion error belonged to: a batched run that looks plausible and is wrong only relative to the same case run alone.
 
-**A consequence for users.** The same $\kappa$ now conducts faster than on `c45ffdd`, roughly as $\sqrt{2}$, so κ values calibrated against the old solver must be recalibrated.
+**Lockstep cases share fate.** One case going non-finite poisons nothing else numerically, since cases are not coupled, but there is no per-case abort, and an error on any device fails the whole run. Only `Workers` isolates per-case failures. Studies that need isolation pick a map executor and pay for it in throughput.
 
-**Lockstep cables share fate.** One cable going non-finite poisons nothing else numerically, since cables are not coupled, but there is no per-cable abort, and an error on any device fails the whole run. Only `Workers` isolates per-item failures. Studies that need isolation pick a map executor and pay for it in throughput.
+**Heterogeneous cases are the simulation package's call.** Whether cases with different grids, timesteps, or stimulus protocols can share an array is decided by `stacked`, which must throw on a set it cannot stack rather than silently run a subset. This package does not pre-filter, because it cannot interpret a case.
 
-**Precision.** Float64 is the supported path. ArmyHeart's `PRECISION.md` reports non-finite results in a majority of the parameter space under Float32, and the time loop accumulates `t += dt`.
+**API surface.** Exported: `Simulation`, `batch`, `simulate`, the executors. Public by qualified name and documented as the extension interface: `stacked`, `unstacked`. No cardiac name appears anywhere in this package.
 
-**API surface.** Exported: `CableGrid`, `CableModel`, `CableBatchConfig`, `batch`, the executors, `extract_cable_solution`. Reachable by qualified name and documented: `semidiscretize_rush_larsen_batched`, `step_batched!`, `solve_batched`, `voltage`, `cell_parameters`. The second tier exists because ArmyHeart's boundary walker forks the solve loop, a real pattern this package should support without exposing integrator fields.
-
-**Equivalence.** A short ToRORdTrauma cable must match ArmyHeart at `39726ee` within tolerances declared before the comparison is run. Bitwise equality is not required, since the diffusion loop is rewritten for CPU.
+**Migrating from ArmyHeart.** A sweep script changes in two places: the cable is built with FlashBang, and `batch(config, params; backend)` becomes `batch(apply, sim, cases, executor)`. Results from the two solvers are not expected to match numerically, since the discretizations differ and ArmyHeart at `c45ffdd` integrated $\kappa/2$; κ values calibrated against ArmyHeart must be recalibrated against FlashBang. Establishing that agreement is FlashBang's validation work, not this package's.
 
 ## 7. Non-goals
 
-- **2D, 3D, or unstructured domains.** FlashBang's job.
-- **Spatially varying κ, non-uniform grids, or other boundary conditions.** The batched kernel assumes all three away, and that is why it is one short loop.
-- **Different grids or spatial functions per cable.** Those break lockstep's shared launch; use a map executor.
-- **Adaptive timestepping.** Cables would need different steps, which is the opposite of lockstep.
-- **Per-cable failure isolation under `Lockstep`.** See §6.
-- **The cardiac sweep layer, prepace caches, and walk viewer.** `sweep_helpers.jl`, `prepace_disk_cache.jl`, and `boundary_walk.jl` stay in ArmyHeart; only batching moves here.
-- **Changes to ArmyHeart.** It remains the frozen reference, and active work on it continues.
+- **Grids, tissue models, cell models, integrators, kernels.** FlashBang, CytoZoo, and their neighbors own these; this is principle 1.
+- **Designing FlashBang's batched layout.** That belongs in FlashBang's DESIGN.md. This document fixes only the two functions it must answer to.
+- **Per-case failure isolation under `Lockstep`.** See §6.
+- **Interpreting, validating, or generating cases.** Generation is the study-design layer's future job; interpretation is the simulation package's.
+- **Sensitivity estimators, optimization, calibration, surrogates.** Excluded by the README's boundaries, unchanged here.
+- **The cardiac sweep layer, prepace caches, and walk viewer.** `sweep_helpers.jl`, `prepace_disk_cache.jl`, and `boundary_walk.jl` stay in ArmyHeart until their own spin-out rows are designed.
+- **Changes to ArmyHeart.** It remains the frozen reference and keeps its own batching while FlashBang catches up.
 
 ## 8. Ecosystem alignment
 
-**FlashBang.** Where the two overlap, this package conforms: `κ` and `ion` match `MonodomainModel`'s field names, so a cable model reads the same in either. It diverges in being 1D-only and in not adopting SciML's `solve` for the batch, because the Rush-Larsen step map does not fit that interface today.
+**FlashBang.** The relationship is the one FlashBang has with CardiacAbstractions, turned around: this package is the light base that owns two functions, and FlashBang is the heavy implementer that adds methods to them. FlashBang's principle that the layout has exactly one owner is why `stacked` is its method and not this package's code.
 
-**CytoZoo.** Its `AbstractCellModel` is where cell models are heading, with `rush_larsen_step!(u_new, u, p, t, dt, model)` and `parameter_index(model, name)`. Its argument order differs from ArmyHeart's contract. Because the contract here is duck-typed and `parameter_index` is a plain function, a CytoZoo adapter is a thin wrapper rather than a redesign (open question 3).
+**SciML.** `Simulation` is a `solve` call waiting to happen, and the map path mirrors `EnsembleProblem` on purpose. The divergence is `stacked`, which SciML's ensemble interface has no slot for.
 
-**KernelAbstractions.** A device is a backend value, as in the rest of the ecosystem. KernelAbstractions 0.10 changes what `CPU` means, so CPU code paths dispatch on `KernelAbstractions.CPU` alongside the generic backend method.
+**LockstepODE.** FlashBang's DESIGN.md already considers delegating its reaction half to LockstepODE's batched machinery. That decision sits entirely behind `stacked` and is invisible here, which is the contract working as intended.
+
+**KernelAbstractions.** A device family is a backend value, as in the rest of the ecosystem. This package now writes no kernels, so its only uses are counting and selecting devices (open question 4).
 
 ## 9. Open questions
 
-1. **`batch` calling convention.** (a) Typed executors passed positionally, as this document specifies; (b) ArmyHeart's keywords, with `backend` required for the config method. **Recommend (a):** the package has no existing callers, so now is the cheapest moment, and it removes the overloaded `backend`.
-2. **Does the README's study lifecycle stay in this package?** (a) Keep it as the roadmap, with cable batching as the first execution backend; (b) narrow the package to cardiac batching and move the lifecycle elsewhere or drop it. **Recommend (a):** a study produces evaluation requests and `Lockstep` is one way to run them, so the two are complementary, and CardiacViz planned to depend on the study layer.
-3. **Cell-model contract.** (a) Duck-typed on ArmyHeart's call form now, CytoZoo adapter later; (b) adopt `CytoZoo.AbstractCellModel` immediately. **Recommend (a):** ToRORdTrauma satisfies it today, whereas (b) requires a rewrite of the model, which is what ToRORdLand is for.
-4. **Return type.** (a) The existing `(times, Vector{Matrix})` tuple; (b) a typed `CableBatchSolution` carrying the config and parameters. **Recommend (a) for now, then (b)** once the study store consumes results, since the store is what would define its fields.
-5. **KernelAbstractions versions.** (a) Allow 0.9 and 0.10; (b) pin 0.9 to keep PoCL and compiler JLLs out of light consumers. **Recommend (a):** recent CUDA versions require 0.10, and pinning would cap GPU support. Option (b) trades that away to make CardiacViz lighter, so it is worth revisiting only if the load cost proves material.
+1. **`batch` calling convention.** (a) Typed executors passed positionally, as this document specifies; (b) ArmyHeart's keywords. **Recommend (a):** the package has no existing callers, so now is the cheapest moment, and it removes the overloaded `backend`.
+2. **Where FlashBang's methods live.** (a) In FlashBang, as a package extension triggered by ParameterStudies; (b) in a ParameterStudies extension triggered by FlashBang; (c) hoist the two functions into a zero-dependency base both depend on. **Recommend (a):** the methods are layout code and FlashBang's rules give its layout one owner. (c) becomes right only if a second simulation package wants the interface without the executors.
+3. **Return type.** (a) A `Vector` of whatever `simulate` returns, in case order; (b) a typed result carrying the cases and provenance, with an optional per-case reducer applied as sub-batches finish so a large sweep never holds every full solution. **Recommend (a) for now, then (b)** once the study store consumes results, since the store is what would define its fields.
+4. **KernelAbstractions as a dependency.** (a) Hard dependency, with `Lockstep{B <: Backend}`; (b) weak dependency, with device counting and selection in an extension, leaving the core package dependency-light. **Recommend (b):** with no kernels written here the hard dependency buys only a type bound, and KernelAbstractions 0.10 brings PoCL along, which light consumers such as CardiacViz and a FlashBang extension would otherwise inherit.
+5. **Proving the lockstep interface before FlashBang can answer it.** (a) Ship map executors and the interface now, and exercise `Lockstep` in this package's tests against a toy stacked simulation (N scalar ODEs as one array); (b) also write `stacked`/`unstacked` methods over ArmyHeart's existing batched solver, as a temporary adapter outside this package, so real sweeps run through `Lockstep` immediately. **Recommend (a):** the toy is the interface's second implementer and keeps CI free of unregistered dependencies; (b) is worth doing only if FlashBang's batched layout is far off.
